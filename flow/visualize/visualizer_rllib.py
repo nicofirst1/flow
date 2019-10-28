@@ -147,6 +147,14 @@ def visualizer_rllib(args):
         config['horizon'] = args.horizon
         env_params.horizon = args.horizon
 
+    if args.checkpoint_num == '-1':
+        checks=os.listdir(args.result_dir)
+        checks = [elem for elem in checks if "check" in elem]
+        checks = [elem.split("_")[1] for elem in checks]
+        checks = [int(elem) for elem in checks]
+        args.checkpoint_num=str(max(checks))
+
+
     # create the agent that will be used to compute the actions
     agent = agent_cls(env=env_name, config=config)
     checkpoint = result_dir + '/checkpoint_' + args.checkpoint_num

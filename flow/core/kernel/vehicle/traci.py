@@ -99,6 +99,11 @@ class TraCIVehicle(KernelVehicle):
                 self.__vehicles[veh_id] = dict()
                 self.__vehicles[veh_id]['type'] = typ['veh_id']
                 self.__vehicles[veh_id]['initial_speed'] = typ['initial_speed']
+                # Custom
+                self.__vehicles[veh_id]["jerk"] = 0
+                self.__vehicles[veh_id]["prev_acceleration"] = 0
+                self.__vehicles[veh_id]['position'] = ()
+                # End Custom
                 self.num_vehicles += 1
                 if typ['acceleration_controller'][0] == RLController:
                     self.num_rl_vehicles += 1
@@ -161,6 +166,10 @@ class TraCIVehicle(KernelVehicle):
             for veh_id in self.__rl_ids:
                 self.__vehicles[veh_id]["last_lc"] = -float("inf")
                 self.prev_last_lc[veh_id] = -float("inf")
+
+                self.__vehicles[veh_id]["jerk"] = 0
+                self.__vehicles[veh_id]["prev_acceleration"] = 0
+                self.__vehicles[veh_id]['position'] = ()
             self._num_departed.clear()
             self._num_arrived.clear()
             self._departed_ids.clear()
@@ -206,6 +215,16 @@ class TraCIVehicle(KernelVehicle):
                     list(_position) + [_angle]
                 self.__vehicles[veh_id]["timestep"] = _time_step
                 self.__vehicles[veh_id]["timedelta"] = _time_delta
+                # Custom params
+                self.__vehicles[veh_id]["position"] = self.kernel_api.vehicle.getPosition(veh_id)
+
+                # add jerk to rl vehicles only
+                curr_acc=self.get_acceleration(veh_id)
+                jerk = curr_acc - self.__vehicles[veh_id]["prev_acceleration"]
+                jerk /= _time_delta
+                self.__vehicles[veh_id]["jerk"] =jerk
+                self.__vehicles[veh_id]["prev_acceleration"] = curr_acc
+
             except TypeError:
                 print(traceback.format_exc())
             headway = vehicle_obs.get(veh_id, {}).get(tc.VAR_LEADER, None)
@@ -330,6 +349,11 @@ class TraCIVehicle(KernelVehicle):
         lc_mode = self.type_parameters[veh_type][
             "lane_change_params"].lane_change_mode
         self.kernel_api.vehicle.setLaneChangeMode(veh_id, lc_mode)
+
+        # custom params initialization
+        self.__vehicles[veh_id]["jerk"] = 0
+        self.__vehicles[veh_id]["prev_acceleration"] = 0
+        self.__vehicles[veh_id]['position'] = ()
 
         # get initial state info
         self.__sumo_obs[veh_id] = dict()
@@ -1026,6 +1050,36 @@ class TraCIVehicle(KernelVehicle):
             departPos=str(pos),
             departSpeed=str(speed))
 
+    def add_rl(self, veh_id, type_id, edge, pos,sumo_obs):
+
+        """See parent class."""
+        if veh_id in self.master_kernel.network.rts:
+            # If the vehicle has its own route, use that route. This is used in
+            # the case of network templates.
+            route_id = 'route{}_0'.format(veh_id)
+        else:
+            num_routes = len(self.master_kernel.network.rts[edge])
+            frac = [val[1] for val in self.master_kernel.network.rts[edge]]
+            route_id = 'route{}_{}'.format(edge, np.random.choice(
+                [i for i in range(num_routes)], size=1, p=frac)[0])
+
+        self.kernel_api.vehicle.addFull(
+            veh_id,
+            route_id,
+            typeID=str(type_id),
+            departLane="random",
+            departPos=str(pos),
+            departSpeed=str(0))
+
+        self._add_departed(veh_id, type_id)
+
+
+
+        # modify the number of vehicles and RL vehicles
+        self.num_vehicles = len(self.get_ids())
+        self.num_rl_vehicles = len(self.get_rl_ids())
+
+
     def get_max_speed(self, veh_id, error=-1001):
         """See parent class."""
         if isinstance(veh_id, (list, np.ndarray)):
@@ -1035,3 +1089,121 @@ class TraCIVehicle(KernelVehicle):
     def set_max_speed(self, veh_id, max_speed):
         """See parent class."""
         self.kernel_api.vehicle.setMaxSpeed(veh_id, max_speed)
+
+    # Custom
+    def get_neighbors(self, veh_id, distance):
+        """
+        Return a list of neighbors for a given vehicle id and a maximum distance
+        :param veh_id: (string) the vehicle id
+        :param distance:  (float) distance in meters
+        :return: (dict), {vehicle_id:distance}
+        """
+
+        def point_dist(pt1, pt2):
+            """
+            Return the distance between two points
+
+            :param pt1: (tuple) Point 1 : (x,y)
+            :param pt2: (tuple) Point 2 : (x,y)
+            :return:  float: distance
+            """
+
+            square_dist = pow(pt1[0] - pt2[0], 2) + pow(pt1[1] - pt2[1], 2)
+            return np.sqrt(square_dist)
+
+        # add support for list of vehicles
+        if isinstance(veh_id, (list, np.ndarray)):
+            return [self.get_neighbors(vehID, distance) for vehID in veh_id]
+
+        # get the current vechile position
+        p_org = self.kernel_api.vehicle.getPosition(veh_id)
+
+        neighbors = dict()
+
+        # for every veh in the env, iterate over id and position
+        for id, pos in self.__vehicles.items():
+            p_i = pos["position"]
+
+            # skip if the id is the same as the wanted one
+            if id == veh_id: continue
+
+            #fixme: some vehicles have empty pos tuple
+            if len(p_i)!=2:
+                termcolor.colored(f"\nPos has length {len(pos)} for veh: {veh_id}\n", "cyan")
+                continue
+
+            # estimate distance
+            dist = point_dist(p_org, p_i)
+
+            # if point_i is close enough ad it to dict
+            if dist <= distance:
+                neighbors[id] = dist
+
+        return neighbors
+
+    def get_acceleration(self, veh_id):
+        """
+        Return the acceleration of vehicle
+        :param veh_id: (string) vehicle id
+        :return: (float) the acceleration in m/s^2
+        """
+
+        return self.kernel_api.vehicle._getUniversal(0x72, veh_id)
+
+    def get_jerk(self, veh_id):
+        """
+        Return the jerk of a vehicle
+        :param veh_id: (string) vehicle id
+        :return: (float) the jerk in m/s^3
+        """
+
+        if isinstance(veh_id, (list, np.ndarray)):
+            return [self.get_jerk(elem) for elem in veh_id]
+
+        return self.__vehicles[veh_id]["jerk"]
+
+    def get_rl_types(self):
+        """
+        Return a list of types for the rl agents
+        :return: list of strings
+        """
+
+        return set([elem.rsplit("_",1)[0] for elem in self.get_rl_ids() ])
+
+    def get_delay(self,veh_type):
+        """
+        Get the total delay for the specified vehicle type
+        :param veh_type: vehicle name, or substring or all
+        :return: np arrray of velocities
+        """
+
+        if veh_type=="all":
+            ids=self.get_ids()
+        else:
+            ids=[elem for elem in self.get_rl_ids() if veh_type in elem]
+
+        vel = np.array(self.get_speed(ids))
+
+        vel = vel[vel >= -1e-6]
+
+        return vel
+
+    def get_sumo_observation(self,veh_id):
+        """
+        Get sumo observation for specific vehicle, return Non if there is no such observation for given vehicle
+        :param veh_id: vehicle id
+        :return: list
+        """
+        try:
+            return self.__sumo_obs[veh_id]
+        except KeyError:
+            return []
+
+    def set_sumo_observation(self,veh_id, obs):
+        """
+        Set sumo observation for specific vehicle id
+        :param veh_id: string, vehicle id
+        :param obs: list, list of observation
+        :return: None
+        """
+        self.__sumo_obs[veh_id]=obs
